@@ -1,265 +1,207 @@
 const express = require('express');
 const http = require('http');
-const { Server } = require('socket.io');
+const socketIO = require('socket.io');
 const path = require('path');
-const crypto = require('crypto');
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: '*' },
-  pingTimeout: 60000,
-  pingInterval: 25000
+const io = socketIO(server, {
+  cors: { origin: '*', methods: ['GET', 'POST'] },
+  pingInterval: 10000,
+  pingTimeout: 5000,
 });
 
 app.use(express.static(path.join(__dirname, 'public')));
 
+// --------------- Room storage ---------------
 const rooms = new Map();
 
-function generateRoomId() {
-  return crypto.randomBytes(4).toString('hex').toUpperCase();
+function generateRoomId(length = 6) {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let result = '';
+  for (let i = 0; i < length; i++) result += chars.charAt(Math.floor(Math.random() * chars.length));
+  return result;
 }
 
-class Room {
-  constructor(id, options = {}) {
-    this.id = id;
-    this.password = options.password || null;
-    this.locked = false;
-    this.users = new Map();
-    this.createdAt = Date.now();
-  }
-
-  addUser(socketId, userInfo) {
-    this.users.set(socketId, userInfo);
-  }
-
-  removeUser(socketId) {
-    this.users.delete(socketId);
-    return this.users.size === 0;
-  }
-
-  getUserList() {
-    return Array.from(this.users.entries()).map(([socketId, info]) => ({
-      socketId,
-      ...info
-    }));
-  }
-
-  isEmpty() {
-    return this.users.size === 0;
-  }
+function createRoom(roomId, password, socket) {
+  const room = {
+    id: roomId,
+    password: password || null,
+    host: socket.id,
+    locked: false,
+    users: new Map(),
+  };
+  const user = {
+    socketId: socket.id,
+    nickname: null,
+    avatar: null,
+    isHost: true,
+    connected: true,
+    disconnectedAt: null,
+  };
+  room.users.set(socket.id, user);
+  rooms.set(roomId, room);
+  return room;
 }
 
+function removeUserFromRoom(roomId, socketId) {
+  const room = rooms.get(roomId);
+  if (!room) return;
+  const user = room.users.get(socketId);
+  room.users.delete(socketId);
+  if (user?._removalTimeout) clearTimeout(user._removalTimeout);
+  if (room.users.size === 0) {
+    rooms.delete(roomId);
+    console.log(`Room ${roomId} deleted (empty).`);
+    return;
+  }
+  if (room.host === socketId) {
+    const first = [...room.users.values()].find(u => u.connected);
+    if (first) {
+      room.host = first.socketId;
+      io.to(roomId).emit('host-changed', { newHost: first.socketId, nickname: first.nickname });
+    }
+  }
+  io.to(roomId).emit('user-left', { socketId });
+}
+
+// --------------- Socket events ---------------
 io.on('connection', (socket) => {
-  let currentRoom = null;
-  let userInfo = null;
+  console.log('New connection:', socket.id);
 
-  socket.on('create-room', (data, callback) => {
-    const roomId = (data.roomId && data.roomId.trim()) || generateRoomId();
-    const upperRoomId = roomId.toUpperCase();
-    
-    if (rooms.has(upperRoomId)) {
-      return callback({ success: false, error: 'Room already exists' });
-    }
-
-    const room = new Room(upperRoomId, {
-      password: data.password || null
-    });
-    rooms.set(upperRoomId, room);
-
-    userInfo = {
-      nickname: data.nickname || 'Anonymous',
-      avatar: data.avatar || '',
-      isHost: true,
-      joinedAt: Date.now()
-    };
-
-    room.addUser(socket.id, userInfo);
-    socket.join(upperRoomId);
-    currentRoom = upperRoomId;
-
-    callback({ success: true, roomId: upperRoomId });
-  });
-
-  socket.on('join-room', (data, callback) => {
-    const roomId = (data.roomId || '').toUpperCase().trim();
-    const room = rooms.get(roomId);
-
-    if (!room) {
-      return callback({ success: false, error: 'Room not found' });
-    }
-
-    if (room.locked) {
-      return callback({ success: false, error: 'Room is locked' });
-    }
-
-    if (room.password && data.password !== room.password) {
-      return callback({ success: false, error: 'Incorrect password' });
-    }
-
-    userInfo = {
-      nickname: data.nickname || 'Anonymous',
-      avatar: data.avatar || '',
-      isHost: false,
-      joinedAt: Date.now()
-    };
-
-    room.addUser(socket.id, userInfo);
-    socket.join(roomId);
-    currentRoom = roomId;
-
-    socket.to(roomId).emit('user-joined', {
-      socketId: socket.id,
-      ...userInfo
-    });
-
-    callback({
-      success: true,
-      roomId,
-      users: room.getUserList(),
-      locked: room.locked
-    });
-  });
-
-  socket.on('send-offer', (data) => {
-    io.to(data.targetSocketId).emit('receive-offer', {
-      fromSocketId: socket.id,
-      sdp: data.sdp
-    });
-  });
-
-  socket.on('send-answer', (data) => {
-    io.to(data.targetSocketId).emit('receive-answer', {
-      fromSocketId: socket.id,
-      sdp: data.sdp
-    });
-  });
-
-  socket.on('send-ice-candidate', (data) => {
-    io.to(data.targetSocketId).emit('receive-ice-candidate', {
-      fromSocketId: socket.id,
-      candidate: data.candidate
-    });
-  });
-
-  socket.on('chat-message', (data) => {
-    if (!currentRoom) return;
-    
-    const message = {
-      from: socket.id,
-      nickname: userInfo?.nickname || 'Anonymous',
-      avatar: userInfo?.avatar || '',
-      message: data.message,
-      timestamp: Date.now(),
-      type: data.type || 'user'
-    };
-
-    io.to(currentRoom).emit('chat-message', message);
-  });
-
-  socket.on('lock-room', (data) => {
-    if (!currentRoom) return;
-    const room = rooms.get(currentRoom);
-    if (!room) return;
-
-    const user = room.users.get(socket.id);
-    if (!user?.isHost) return;
-
-    room.locked = data.locked;
-    io.to(currentRoom).emit('room-locked', { locked: data.locked });
-  });
-
-  socket.on('kick-user', (data) => {
-    if (!currentRoom) return;
-    const room = rooms.get(currentRoom);
-    if (!room) return;
-
-    const user = room.users.get(socket.id);
-    if (!user?.isHost) return;
-
-    const targetSocket = io.sockets.sockets.get(data.targetSocketId);
-    if (targetSocket) {
-      targetSocket.emit('kicked', { reason: data.reason || 'You have been kicked' });
-      targetSocket.leave(currentRoom);
-      room.removeUser(data.targetSocketId);
-      
-      io.to(currentRoom).emit('user-left', {
-        socketId: data.targetSocketId,
-        notify: true
+  socket.on('create-room', ({ roomId, password, nickname, avatar }, cb) => {
+    try {
+      let id = (roomId?.trim()) || generateRoomId();
+      if (rooms.has(id)) return cb({ error: 'Room already exists.' });
+      const room = createRoom(id, password || null, socket);
+      const user = room.users.get(socket.id);
+      user.nickname = nickname || 'Anonymous';
+      user.avatar = avatar || '';
+      socket.join(id);
+      socket.data.roomId = id;
+      cb({
+        success: true,
+        roomId: id,
+        users: [...room.users.values()].map(u => ({
+          socketId: u.socketId, nickname: u.nickname, avatar: u.avatar, isHost: u.socketId === room.host
+        })),
       });
+    } catch (e) { cb({ error: e.message }); }
+  });
+
+  socket.on('join-room', ({ roomId, password, nickname, avatar }, cb) => {
+    try {
+      const room = rooms.get(roomId);
+      if (!room) return cb({ error: 'Room not found.' });
+      if (room.locked) return cb({ error: 'Room is locked.' });
+      if (room.password && room.password !== password) return cb({ error: 'Incorrect password.' });
+
+      // Already in room? rejoin
+      if (room.users.has(socket.id)) {
+        const u = room.users.get(socket.id);
+        u.nickname = nickname || u.nickname;
+        u.avatar = avatar || u.avatar;
+        u.connected = true;
+        u.disconnectedAt = null;
+        if (u._removalTimeout) clearTimeout(u._removalTimeout);
+        socket.join(roomId);
+        socket.data.roomId = roomId;
+        io.to(roomId).emit('user-joined', { socketId: socket.id, nickname: u.nickname, avatar: u.avatar, isHost: socket.id === room.host });
+        return cb({ success: true, roomId, users: getOnlineUsers(room, socket.id) });
+      }
+
+      const user = { socketId: socket.id, nickname: nickname || 'Anonymous', avatar: avatar || '', isHost: false, connected: true, disconnectedAt: null };
+      room.users.set(socket.id, user);
+      socket.join(roomId);
+      socket.data.roomId = roomId;
+
+      // Notify new user about existing peers
+      const existing = getOnlineUsers(room, socket.id);
+      // Notify all *other* users about the new joiner
+      socket.to(roomId).emit('user-joined', { socketId: socket.id, nickname: user.nickname, avatar: user.avatar, isHost: false });
+      io.to(roomId).emit('chat-message', { type: 'system', text: `${user.nickname} joined the room.`, from: 'system' });
+
+      cb({ success: true, roomId, users: existing, myData: { socketId: socket.id, nickname: user.nickname, avatar: user.avatar, isHost: false } });
+    } catch (e) { cb({ error: e.message }); }
+  });
+
+  // Rejoin after reconnect
+  socket.on('rejoin-room', ({ roomId, nickname, avatar }, cb) => {
+    const room = rooms.get(roomId);
+    if (!room) return cb({ error: 'Room not found.' });
+    const user = room.users.get(socket.id);
+    if (user) {
+      user.connected = true;
+      user.disconnectedAt = null;
+      user.nickname = nickname || user.nickname;
+      user.avatar = avatar || user.avatar;
+      if (user._removalTimeout) clearTimeout(user._removalTimeout);
+      socket.join(roomId);
+      socket.data.roomId = roomId;
+      io.to(roomId).emit('user-updated', { socketId: socket.id, nickname: user.nickname, avatar: user.avatar, connected: true });
+      return cb({ success: true, users: getOnlineUsers(room, socket.id) });
     }
+    cb({ error: 'Reconnection failed. Please join again.' });
   });
 
-  socket.on('update-user', (data) => {
-    if (!currentRoom || !userInfo) return;
-    const room = rooms.get(currentRoom);
-    if (!room) return;
-
-    if (data.nickname) userInfo.nickname = data.nickname;
-    if (data.avatar) userInfo.avatar = data.avatar;
-
-    room.addUser(socket.id, userInfo);
-    io.to(currentRoom).emit('user-updated', {
-      socketId: socket.id,
-      ...userInfo
-    });
+  socket.on('lock-room', (locked, cb) => {
+    const roomId = socket.data.roomId;
+    const room = rooms.get(roomId);
+    if (!room || room.host !== socket.id) return cb({ error: 'Only host can lock.' });
+    room.locked = !!locked;
+    io.to(roomId).emit('room-locked', room.locked);
+    cb({ success: true, locked: room.locked });
   });
 
+  socket.on('kick-user', ({ targetSocketId }, cb) => {
+    const roomId = socket.data.roomId;
+    const room = rooms.get(roomId);
+    if (!room || room.host !== socket.id) return cb({ error: 'Only host can kick.' });
+    const target = io.sockets.sockets.get(targetSocketId);
+    if (target) {
+      target.emit('kicked');
+      target.disconnect(true);
+    } else {
+      const u = room.users.get(targetSocketId);
+      if (u) { u.connected = false; removeUserFromRoom(roomId, targetSocketId); }
+    }
+    cb({ success: true });
+  });
+
+  // WebRTC signaling
+  socket.on('offer', ({ to, offer }) => io.to(to).emit('offer', { from: socket.id, offer }));
+  socket.on('answer', ({ to, answer }) => io.to(to).emit('answer', { from: socket.id, answer }));
+  socket.on('ice-candidate', ({ to, candidate }) => io.to(to).emit('ice-candidate', { from: socket.id, candidate }));
+
+  // Chat relay
+  socket.on('chat-message', (data) => {
+    const roomId = socket.data.roomId;
+    if (roomId) socket.to(roomId).emit('chat-message', { type: 'chat', text: data.text, from: data.from, avatar: data.avatar, socketId: socket.id });
+  });
+
+  // Disconnect handling
   socket.on('disconnect', () => {
-    if (currentRoom) {
-      const room = rooms.get(currentRoom);
-      if (room) {
-        const isEmpty = room.removeUser(socket.id);
-        
-        socket.to(currentRoom).emit('user-left', {
-          socketId: socket.id,
-          notify: true
-        });
-
-        if (isEmpty) {
-          rooms.delete(currentRoom);
-        }
+    const roomId = socket.data.roomId;
+    if (roomId && rooms.has(roomId)) {
+      const room = rooms.get(roomId);
+      const user = room.users.get(socket.id);
+      if (user) {
+        user.connected = false;
+        user.disconnectedAt = Date.now();
+        user._removalTimeout = setTimeout(() => removeUserFromRoom(roomId, socket.id), 30000);
+        io.to(roomId).emit('user-disconnected', { socketId: socket.id, nickname: user.nickname });
+        io.to(roomId).emit('chat-message', { type: 'system', text: `${user.nickname} left the room.`, from: 'system' });
       }
     }
-  });
-
-  socket.on('leave-room', () => {
-    if (currentRoom) {
-      const room = rooms.get(currentRoom);
-      if (room) {
-        const isEmpty = room.removeUser(socket.id);
-        
-        socket.to(currentRoom).emit('user-left', {
-          socketId: socket.id,
-          notify: true
-        });
-
-        if (isEmpty) {
-          rooms.delete(currentRoom);
-        }
-      }
-      
-      socket.leave(currentRoom);
-      currentRoom = null;
-      userInfo = null;
-    }
+    socket.data.roomId = null;
   });
 });
 
-setInterval(() => {
-  const now = Date.now();
-  for (const [roomId, room] of rooms.entries()) {
-    if (room.isEmpty() && now - room.createdAt > 3600000) {
-      rooms.delete(roomId);
-    }
-  }
-}, 300000);
-
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', rooms: rooms.size, uptime: process.uptime() });
-});
+function getOnlineUsers(room, excludeSocketId) {
+  return [...room.users.values()]
+    .filter(u => u.socketId !== excludeSocketId && (u.connected || (u.disconnectedAt && Date.now() - u.disconnectedAt < 30000)))
+    .map(u => ({ socketId: u.socketId, nickname: u.nickname, avatar: u.avatar, isHost: u.socketId === room.host }));
+}
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
