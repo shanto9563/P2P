@@ -2,225 +2,90 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>P2P File Share - Browser to Browser File Sharing</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>P2P File Share</title>
   <link rel="stylesheet" href="style.css">
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📁</text></svg>">
+  <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
 </head>
 <body>
-  <div id="loading-screen" class="loading-screen">
-    <div class="loader">
-      <div class="loader-icon">📁</div>
-      <div class="loader-text">P2P File Share</div>
-      <div class="loader-bar"><div class="loader-progress"></div></div>
-    </div>
-  </div>
+  <div id="app">
+    <div id="loading-overlay" class="overlay"><div class="spinner"></div><p>Connecting...</p></div>
 
-  <div id="landing-page" class="page active">
-    <div class="landing-container">
-      <div class="landing-header">
-        <div class="logo">📁</div>
+    <div id="main-container" class="container" style="display:none;">
+      <header class="glass">
         <h1>P2P File Share</h1>
-        <p class="tagline">Secure browser-to-browser file sharing. No server storage.</p>
+        <div id="connection-status" class="status-dot" title="Connection"></div>
+      </header>
+
+      <!-- Room creation / join -->
+      <div id="room-panel" class="glass card">
+        <div class="tabs">
+          <button id="tab-create" class="tab active">Create Room</button>
+          <button id="tab-join" class="tab">Join Room</button>
+        </div>
+        <div id="create-section" class="tab-content">
+          <input type="text" id="custom-room-id" placeholder="Custom Room ID (optional)" maxlength="20">
+          <input type="password" id="create-password" placeholder="Password (optional)">
+          <input type="text" id="create-nickname" placeholder="Your nickname" maxlength="20">
+          <button id="btn-create-room" class="btn primary">Create Room</button>
+        </div>
+        <div id="join-section" class="tab-content" style="display:none;">
+          <input type="text" id="join-room-id" placeholder="Room ID" maxlength="20">
+          <input type="password" id="join-password" placeholder="Password (if any)">
+          <input type="text" id="join-nickname" placeholder="Your nickname" maxlength="20">
+          <button id="btn-join-room" class="btn primary">Join Room</button>
+        </div>
       </div>
 
-      <div class="landing-card glass">
-        <div class="nickname-section">
-          <label>Your Nickname</label>
-          <input type="text" id="nickname-input" placeholder="Enter your nickname" maxlength="20">
-        </div>
-
-        <div class="action-buttons">
-          <button id="create-room-btn" class="btn btn-primary">
-            <span>✨</span> Create Room
-          </button>
-          
-          <div class="divider"><span>OR</span></div>
-
-          <div class="join-section">
-            <input type="text" id="room-id-input" placeholder="Enter Room ID" maxlength="8" autocomplete="off">
-            <input type="password" id="room-password-input" placeholder="Password (optional)">
-            <button id="join-room-btn" class="btn btn-secondary">Join Room</button>
+      <!-- In‑room UI -->
+      <div id="room-ui" style="display:none;">
+        <div class="room-header glass">
+          <h2>Room: <span id="room-id-display"></span></h2>
+          <div class="room-actions">
+            <button id="btn-copy-link" class="btn small" title="Copy link">📋 Copy Link</button>
+            <button id="btn-show-qr" class="btn small" title="QR Code">📱 QR</button>
+            <button id="btn-lock-room" class="btn small" title="Lock room">🔒</button>
+            <button id="btn-leave-room" class="btn small danger">Leave</button>
           </div>
         </div>
-      </div>
-
-      <div class="features-grid">
-        <div class="feature-item glass">
-          <div class="feature-icon">🔒</div>
-          <h3>End-to-End Encrypted</h3>
-          <p>WebRTC ensures your files are encrypted in transit</p>
-        </div>
-        <div class="feature-item glass">
-          <div class="feature-icon">⚡</div>
-          <h3>Lightning Fast</h3>
-          <p>Direct peer-to-peer transfer, no server bottleneck</p>
-        </div>
-        <div class="feature-item glass">
-          <div class="feature-icon">📂</div>
-          <h3>Any File Type</h3>
-          <p>Share any file, any size, with folder structure</p>
-        </div>
-        <div class="feature-item glass">
-          <div class="feature-icon">🌐</div>
-          <h3>No Installation</h3>
-          <p>Works in any modern browser, no setup required</p>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <div id="room-page" class="page">
-    <header class="room-header glass">
-      <div class="header-left">
-        <button id="toggle-sidebar-btn" class="icon-btn" title="Toggle sidebar">☰</button>
-        <div class="room-info">
-          <h2 id="room-title">Room</h2>
-          <div class="room-id-display">
-            <span id="room-id-text"></span>
-            <button id="copy-link-btn" class="icon-btn small" title="Copy link">📋</button>
-            <button id="show-qr-btn" class="icon-btn small" title="QR Code">📱</button>
+        <div class="room-content">
+          <div class="sidebar glass">
+            <h3>Users</h3>
+            <ul id="user-list"></ul>
           </div>
-        </div>
-      </div>
-      <div class="header-center">
-        <div class="connection-indicator" id="connection-indicator">
-          <span class="indicator-dot"></span>
-          <span class="indicator-text">Connected</span>
-        </div>
-      </div>
-      <div class="header-right">
-        <button id="lock-room-btn" class="icon-btn" title="Lock room">🔓</button>
-        <button id="leave-room-btn" class="icon-btn" title="Leave room">🚪</button>
-      </div>
-    </header>
-
-    <div class="room-layout">
-      <aside id="sidebar" class="sidebar glass">
-        <div class="sidebar-header">
-          <h3>Users (<span id="user-count">0</span>)</h3>
-        </div>
-        <div id="users-list" class="users-list"></div>
-        <div class="sidebar-footer">
-          <div class="my-info">
-            <div class="avatar" id="my-avatar"></div>
-            <span id="my-nickname">Me</span>
-          </div>
-        </div>
-      </aside>
-
-      <main class="main-content">
-        <div id="drop-zone" class="drop-zone glass">
-          <div class="drop-zone-content">
-            <div class="drop-icon">📤</div>
-            <h3>Drop files here</h3>
-            <p>or click to browse</p>
-            <div class="drop-actions">
-              <button id="select-files-btn" class="btn btn-primary">Select Files</button>
-              <button id="select-folder-btn" class="btn btn-secondary">Select Folder</button>
+          <div class="main-area">
+            <div class="chat-section glass">
+              <div id="chat-messages" class="chat-messages"></div>
+              <div class="chat-input-area">
+                <input type="text" id="chat-input" placeholder="Type a message...">
+                <button id="btn-send-chat" class="btn">Send</button>
+              </div>
             </div>
-            <input type="file" id="file-input" multiple hidden>
-            <input type="file" id="folder-input" webkitdirectory hidden>
+            <div class="file-section glass">
+              <div class="file-actions">
+                <button id="btn-select-files" class="btn">Select Files</button>
+                <button id="btn-select-folder" class="btn">Select Folder</button>
+                <span id="send-to-label">Send to:</span>
+                <select id="recipient-select" multiple size="1"><option value="all" selected>Everyone</option></select>
+                <button id="btn-send-files" class="btn primary" disabled>Send</button>
+                <button id="btn-cancel-transfers" class="btn danger" style="display:none;">Cancel All</button>
+              </div>
+              <div id="file-drop-zone" class="drop-zone"><p>Drag & drop files or folders here</p></div>
+              <div id="selected-files" class="selected-files"></div>
+              <div id="transfer-list" class="transfer-list"></div>
+            </div>
           </div>
         </div>
+      </div>
 
-        <div id="send-to-section" class="send-to-section glass" style="display:none;">
-          <div class="send-to-header">
-            <h4>Send to:</h4>
-            <label class="checkbox-label">
-              <input type="radio" name="send-to" value="all" checked> Everyone
-            </label>
-            <label class="checkbox-label">
-              <input type="radio" name="send-to" value="selected"> Selected
-            </label>
-          </div>
-          <div id="send-to-users" class="send-to-users"></div>
-        </div>
+      <!-- QR modal -->
+      <div id="qr-modal" class="modal"><div class="modal-content glass"><span class="close">&times;</span><div id="qr-code"></div></div></div>
 
-        <div id="transfers-section" class="transfers-section" style="display:none;">
-          <div class="section-header">
-            <h3>Transfers</h3>
-            <button id="clear-completed-btn" class="btn btn-small">Clear Completed</button>
-          </div>
-          <div id="transfers-list" class="transfers-list"></div>
-        </div>
-
-        <div class="chat-section glass">
-          <div class="chat-header">
-            <h3>💬 Chat</h3>
-            <button id="toggle-emoji-btn" class="icon-btn small">😊</button>
-          </div>
-          <div id="chat-messages" class="chat-messages"></div>
-          <div class="chat-input-area">
-            <div id="emoji-picker" class="emoji-picker" style="display:none;"></div>
-            <input type="text" id="chat-input" placeholder="Type a message..." maxlength="500">
-            <button id="send-chat-btn" class="icon-btn">➤</button>
-          </div>
-        </div>
-      </main>
+      <footer style="text-align:center;padding:20px;color:#888;border-top:1px solid rgba(255,255,255,.1)">Made by Dibya Jyoti</footer>
     </div>
   </div>
 
-  <div id="qr-modal" class="modal">
-    <div class="modal-content glass">
-      <div class="modal-header">
-        <h3>Join via QR Code</h3>
-        <button class="modal-close" data-modal="qr-modal">×</button>
-      </div>
-      <div class="modal-body">
-        <div id="qr-code-container" class="qr-code-container"></div>
-        <p class="qr-hint">Scan this QR code to join the room</p>
-      </div>
-    </div>
-  </div>
-
-  <div id="preview-modal" class="modal">
-    <div class="modal-content glass preview-modal-content">
-      <div class="modal-header">
-        <h3 id="preview-title">Preview</h3>
-        <button class="modal-close" data-modal="preview-modal">×</button>
-      </div>
-      <div class="modal-body" id="preview-body"></div>
-    </div>
-  </div>
-
-  <div id="password-modal" class="modal">
-    <div class="modal-content glass">
-      <div class="modal-header">
-        <h3>Room Password</h3>
-      </div>
-      <div class="modal-body">
-        <p>This room is password protected. Enter the password to join.</p>
-        <input type="password" id="modal-password-input" placeholder="Enter password">
-        <div class="modal-actions">
-          <button id="modal-password-cancel" class="btn btn-secondary">Cancel</button>
-          <button id="modal-password-submit" class="btn btn-primary">Join</button>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <div id="file-request-modal" class="modal">
-    <div class="modal-content glass">
-      <div class="modal-header">
-        <h3>Incoming File</h3>
-      </div>
-      <div class="modal-body">
-        <div id="file-request-info" class="file-request-info"></div>
-        <div class="modal-actions">
-          <button id="file-request-reject" class="btn btn-secondary">Reject</button>
-          <button id="file-request-accept" class="btn btn-primary">Accept</button>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <div id="toast-container" class="toast-container"></div>
-
-  <footer style="text-align:center;padding:20px;color:#888;border-top:1px solid rgba(255,255,255,.1)">
-    Made by Dibya Jyoti
-  </footer>
-
+  <div id="toast-container"></div>
   <script src="/socket.io/socket.io.js"></script>
   <script src="webrtc.js"></script>
   <script src="app.js"></script>
