@@ -1,723 +1,434 @@
-// State
-let socket = null;
-let webrtcManager = null;
-let currentRoomId = null;
-let currentUser = null;
-let users = new Map();
-let isHost = false;
-let selectedFiles = [];
-let pendingFileRequest = null;
-let transferElements = new Map();
-let myAvatar = '';
+class FileShareApp {
+  constructor() {
+    this.socket = null;
+    this.webrtc = null;
+    this.roomId = null;
+    this.myData = { socketId: null, nickname: '', avatar: '', isHost: false };
+    this.users = new Map();      // socketId -> user object
+    this.selectedFiles = [];     // { file, relativePath, transferId (temp) }
+    this.transfers = new Map();  // transferId -> { peerId, file, status, bytes, total, startTime, speed, etc }
+    this.pendingOffers = new Map();
+    this.transferIdCounter = 0;
+    this.autoReconnect = true;
+  }
 
-// Emojis
-const EMOJIS = ['😀','😃','😄','😁','😆','😅','🤣','😂','🙂','🙃','😉','😊','😇','🥰','😍','🤩','😘','😗','😚','😙','🥲','😋','😛','😜','🤪','😝','🤑','🤗','🤭','🤫','🤔','🤐','🤨','😐','😑','😶','😏','😒','🙄','😬','🤥','😌','😔','😪','🤤','😴','😷','🤒','🤕','🤢','🤮','🥵','🥶','🥴','😵','🤯','🤠','🥳','🥸','😎','🤓','🧐'];
-
-// Initialize
-document.addEventListener('DOMContentLoaded', () => {
-  setTimeout(() => {
-    document.getElementById('loading-screen').classList.add('hidden');
-  }, 1500);
-
-  setupLandingPage();
-  setupRoomPage();
-  setupModals();
-  setupEmojiPicker();
-});
-
-function setupLandingPage() {
-  const nicknameInput = document.getElementById('nickname-input');
-  const savedNickname = localStorage.getItem('nickname');
-  if (savedNickname) nicknameInput.value = savedNickname;
-
-  document.getElementById('create-room-btn').addEventListener('click', createRoom);
-  document.getElementById('join-room-btn').addEventListener('click', joinRoom);
-  
-  document.getElementById('room-id-input').addEventListener('input', (e) => {
-    e.target.value = e.target.value.toUpperCase();
-  });
-}
-
-function setupRoomPage() {
-  const dropZone = document.getElementById('drop-zone');
-  const fileInput = document.getElementById('file-input');
-  const folderInput = document.getElementById('folder-input');
-
-  document.getElementById('select-files-btn').addEventListener('click', () => fileInput.click());
-  document.getElementById('select-folder-btn').addEventListener('click', () => folderInput.click());
-  
-  fileInput.addEventListener('change', (e) => handleFiles(e.target.files, false));
-  folderInput.addEventListener('change', (e) => handleFiles(e.target.files, true));
-
-  dropZone.addEventListener('dragover', (e) => {
-    e.preventDefault();
-    dropZone.classList.add('drag-over');
-  });
-
-  dropZone.addEventListener('dragleave', () => {
-    dropZone.classList.remove('drag-over');
-  });
-
-  dropZone.addEventListener('drop', (e) => {
-    e.preventDefault();
-    dropZone.classList.remove('drag-over');
-    
-    const items = e.dataTransfer.items;
-    if (items) {
-      const files = [];
-      for (let i = 0; i < items.length; i++) {
-        const item = items[i].webkitGetAsEntry();
-        if (item) traverseFileTree(item, '', files);
-      }
-      setTimeout(() => handleFileEntries(files), 500);
-    } else {
-      handleFiles(e.dataTransfer.files, false);
-    }
-  });
-
-  document.getElementById('toggle-sidebar-btn').addEventListener('click', () => {
-    document.getElementById('sidebar').classList.toggle('open');
-  });
-
-  document.getElementById('copy-link-btn').addEventListener('click', copyRoomLink);
-  document.getElementById('show-qr-btn').addEventListener('click', showQRCode);
-  document.getElementById('lock-room-btn').addEventListener('click', toggleLockRoom);
-  document.getElementById('leave-room-btn').addEventListener('click', leaveRoom);
-
-  document.getElementById('send-chat-btn').addEventListener('click', sendChatMessage);
-  document.getElementById('chat-input').addEventListener('keypress', (e) => {
-    if (e.key === 'Enter') sendChatMessage();
-  });
-
-  document.getElementById('clear-completed-btn').addEventListener('click', clearCompletedTransfers);
-
-  document.querySelectorAll('input[name="send-to"]').forEach(radio => {
-    radio.addEventListener('change', updateSendToUI);
-  });
-}
-
-function setupModals() {
-  document.querySelectorAll('.modal-close').forEach(btn => {
-    btn.addEventListener('click', () => {
-      const modalId = btn.getAttribute('data-modal');
-      closeModal(modalId);
+  init() {
+    this.cacheDom();
+    this.socket = io({ reconnection: true, reconnectionAttempts: 20, reconnectionDelay: 1000 });
+    this.webrtc = new WebRTCManager(this.socket, {
+      onChatMessage: (m) => this.addChatMessage(m.from, m.text, m.avatar, false),
+      onFileTransferOffer: (o) => this.handleIncomingOffer(o),
+      onFileTransferResponse: (o) => this.handleTransferResponse(o),
+      onFileProgress: (p) => this.updateTransferProgress(p),
+      onFileReceived: (f) => this.handleReceivedFile(f),
+      onPeerConnectionStateChange: (peerId, state) => this.updatePeerStatus(peerId, state)
     });
-  });
 
-  document.querySelectorAll('.modal').forEach(modal => {
-    modal.addEventListener('click', (e) => {
-      if (e.target === modal) closeModal(modal.id);
-    });
-  });
-
-  document.getElementById('modal-password-cancel').addEventListener('click', () => closeModal('password-modal'));
-  document.getElementById('modal-password-submit').addEventListener('click', submitPassword);
-  
-  document.getElementById('file-request-accept').addEventListener('click', acceptPendingFile);
-  document.getElementById('file-request-reject').addEventListener('click', rejectPendingFile);
-}
-
-function setupEmojiPicker() {
-  const picker = document.getElementById('emoji-picker');
-  EMOJIS.forEach(emoji => {
-    const btn = document.createElement('button');
-    btn.textContent = emoji;
-    btn.addEventListener('click', () => {
-      document.getElementById('chat-input').value += emoji;
-      picker.style.display = 'none';
-    });
-    picker.appendChild(btn);
-  });
-
-  document.getElementById('toggle-emoji-btn').addEventListener('click', () => {
-    picker.style.display = picker.style.display === 'none' ? 'grid' : 'none';
-  });
-}
-
-function traverseFileTree(item, path, files) {
-  if (item.isFile) {
-    item.file((file) => {
-      Object.defineProperty(file, 'webkitRelativePath', {
-        value: path + file.name,
-        writable: false
-      });
-      files.push({ file, path });
-    });
-  } else if (item.isDirectory) {
-    const dirReader = item.createReader();
-    dirReader.readEntries((entries) => {
-      for (let i = 0; i < entries.length; i++) {
-        traverseFileTree(entries[i], path + item.name + '/', files);
+    this.socket.on('connect', () => {
+      this.hideLoading();
+      this.updateConnectionStatus('connected');
+      if (this.autoReconnect && this.roomId && this.myData.nickname) {
+        this.socket.emit('rejoin-room', { roomId: this.roomId, nickname: this.myData.nickname, avatar: this.myData.avatar }, (res) => {
+          if (res.success) this.onRejoined(res.users);
+          else this.showToast('Could not rejoin room.', 'error');
+        });
       }
     });
-  }
-}
+    this.socket.on('disconnect', () => this.updateConnectionStatus('disconnected'));
+    this.socket.on('reconnect_attempt', () => this.updateConnectionStatus('connecting'));
 
-async function createRoom() {
-  const nickname = document.getElementById('nickname-input').value.trim() || 'Anonymous';
-  localStorage.setItem('nickname', nickname);
+    // Room events
+    this.socket.on('user-joined', (user) => this.onUserJoined(user));
+    this.socket.on('user-left', ({ socketId }) => this.onUserLeft(socketId));
+    this.socket.on('user-disconnected', ({ socketId }) => this.onUserDisconnected(socketId));
+    this.socket.on('user-updated', (u) => this.onUserUpdated(u));
+    this.socket.on('host-changed', ({ newHost }) => { this.myData.isHost = (newHost === this.myData.socketId); this.renderUserList(); });
+    this.socket.on('room-locked', (locked) => this.showToast(locked ? 'Room locked' : 'Room unlocked'));
+    this.socket.on('kicked', () => { this.leaveRoom(); this.showToast('You were kicked by the host.', 'error'); });
+    this.socket.on('chat-message', (msg) => this.addChatMessage(msg.from, msg.text, msg.avatar, true));
 
-  const roomId = prompt('Enter custom room ID (leave empty for random):') || '';
-  const password = prompt('Enter room password (leave empty for none):') || '';
-
-  connectSocket(nickname, roomId.trim(), password);
-}
-
-async function joinRoom() {
-  const nickname = document.getElementById('nickname-input').value.trim() || 'Anonymous';
-  const roomId = document.getElementById('room-id-input').value.trim();
-  const password = document.getElementById('room-password-input').value;
-
-  if (!roomId) {
-    showToast('Please enter a room ID', 'error');
-    return;
+    this.bindEvents();
   }
 
-  localStorage.setItem('nickname', nickname);
-  connectSocket(nickname, roomId, password);
-}
-
-function connectSocket(nickname, roomId, password) {
-  socket = io();
-  
-  socket.on('connect', () => {
-    myAvatar = generateAvatar(nickname);
-    currentUser = { nickname, avatar: myAvatar };
-
-    if (roomId) {
-      socket.emit('join-room', { roomId, nickname, avatar: myAvatar, password }, (response) => {
-        if (response.success) {
-          enterRoom(response.roomId, response.users);
-        } else {
-          if (response.error === 'Incorrect password') {
-            showPasswordModal(roomId);
-          } else {
-            showToast(response.error, 'error');
-          }
-        }
-      });
-    } else {
-      socket.emit('create-room', { nickname, avatar: myAvatar, password }, (response) => {
-        if (response.success) {
-          enterRoom(response.roomId, []);
-        } else {
-          showToast(response.error, 'error');
-        }
-      });
-    }
-  });
-
-  socket.on('disconnect', () => {
-    updateConnectionIndicator('disconnected');
-  });
-
-  socket.on('connect_error', () => {
-    updateConnectionIndicator('disconnected');
-  });
-
-  socket.on('user-joined', (user) => {
-    users.set(user.socketId, user);
-    renderUsers();
-    updateSendToUI();
-    addSystemMessage(`${user.nickname} joined the room`);
-    showToast(`${user.nickname} joined`, 'info');
-    
-    webrtcManager.createPeerConnection(user.socketId, true);
-  });
-
-  socket.on('user-left', (data) => {
-    const user = users.get(data.socketId);
-    users.delete(data.socketId);
-    renderUsers();
-    updateSendToUI();
-    
-    if (webrtcManager) webrtcManager.removePeer(data.socketId);
-    
-    if (data.notify && user) {
-      addSystemMessage(`${user.nickname} left the room`);
-      showToast(`${user.nickname} left`, 'info');
-    }
-  });
-
-  socket.on('chat-message', (message) => {
-    addChatMessage(message);
-  });
-
-  socket.on('room-locked', (data) => {
-    const lockBtn = document.getElementById('lock-room-btn');
-    lockBtn.textContent = data.locked ? '🔒' : '🔓';
-    addSystemMessage(data.locked ? 'Room is now locked' : 'Room is now unlocked');
-  });
-
-  socket.on('kicked', (data) => {
-    showToast(data.reason || 'You have been kicked', 'error');
-    setTimeout(() => location.reload(), 2000);
-  });
-
-  socket.on('user-updated', (user) => {
-    users.set(user.socketId, user);
-    renderUsers();
-  });
-}
-
-function enterRoom(roomId, userList) {
-  currentRoomId = roomId;
-  
-  document.getElementById('landing-page').classList.remove('active');
-  document.getElementById('room-page').classList.add('active');
-  
-  document.getElementById('room-title').textContent = `Room: ${roomId}`;
-  document.getElementById('room-id-text').textContent = roomId;
-  document.getElementById('my-nickname').textContent = currentUser.nickname;
-  document.getElementById('my-avatar').innerHTML = `<img src="${myAvatar}" alt="avatar">`;
-
-  users = new Map();
-  userList.forEach(user => {
-    users.set(user.socketId, user);
-    if (user.isHost) isHost = true;
-  });
-
-  renderUsers();
-  updateSendToUI();
-  updateConnectionIndicator('connected');
-
-  webrtcManager = new WebRTCManager(socket);
-  
-  webrtcManager.onPeerConnected = (socketId) => {
-    console.log(`Peer connected: ${socketId}`);
-  };
-
-  webrtcManager.onPeerDisconnected = (socketId) => {
-    console.log(`Peer disconnected: ${socketId}`);
-  };
-
-  webrtcManager.onFileRequest = (receive) => {
-    showFileRequestModal(receive);
-  };
-
-  webrtcManager.onTransferUpdate = (transfer) => {
-    updateTransferUI(transfer);
-  };
-
-  webrtcManager.onTransferComplete = (transfer) => {
-    if (transfer.blob) {
-      showToast(`Received: ${transfer.name}`, 'success');
-      addSystemMessage(`File received: ${transfer.name}`);
-    }
-  };
-
-  userList.forEach(user => {
-    if (user.socketId !== socket.id) {
-      webrtcManager.createPeerConnection(user.socketId, false);
-    }
-  });
-
-  addSystemMessage('You joined the room');
-}
-
-function renderUsers() {
-  const usersList = document.getElementById('users-list');
-  const userCount = document.getElementById('user-count');
-  
-  userCount.textContent = users.size;
-  usersList.innerHTML = '';
-
-  users.forEach((user, socketId) => {
-    const item = document.createElement('div');
-    item.className = 'user-item';
-    
-    const badge = user.isHost ? '<span class="host-badge">👑 Host</span>' : '';
-    const kickBtn = isHost && !user.isHost && socketId !== socket.id 
-      ? `<button class="icon-btn small" onclick="kickUser('${socketId}')">🚫</button>` 
-      : '';
-
-    item.innerHTML = `
-      <div class="avatar"><img src="${user.avatar}" alt=""></div>
-      <div class="user-info">
-        <div class="user-name">${escapeHtml(user.nickname)}</div>
-        <div class="user-badge">${badge}</div>
-      </div>
-      <div class="user-actions">${kickBtn}</div>
-    `;
-    
-    usersList.appendChild(item);
-  });
-}
-
-function updateSendToUI() {
-  const section = document.getElementById('send-to-section');
-  const usersContainer = document.getElementById('send-to-users');
-  
-  if (users.size <= 1) {
-    section.style.display = 'none';
-    return;
+  cacheDom() {
+    this.els = {
+      loading: document.getElementById('loading-overlay'),
+      main: document.getElementById('main-container'),
+      statusDot: document.getElementById('connection-status'),
+      roomPanel: document.getElementById('room-panel'),
+      roomUi: document.getElementById('room-ui'),
+      roomIdDisplay: document.getElementById('room-id-display'),
+      userList: document.getElementById('user-list'),
+      chatMessages: document.getElementById('chat-messages'),
+      chatInput: document.getElementById('chat-input'),
+      recipientSelect: document.getElementById('recipient-select'),
+      fileDropZone: document.getElementById('file-drop-zone'),
+      selectedFilesDiv: document.getElementById('selected-files'),
+      transferList: document.getElementById('transfer-list'),
+      btnSend: document.getElementById('btn-send-files'),
+      btnCancelTransfers: document.getElementById('btn-cancel-transfers'),
+      qrModal: document.getElementById('qr-modal'),
+      qrCodeDiv: document.getElementById('qr-code'),
+      lockBtn: document.getElementById('btn-lock-room'),
+    };
   }
 
-  section.style.display = 'block';
-  usersContainer.innerHTML = '';
+  bindEvents() {
+    // Tabs
+    document.getElementById('tab-create').onclick = () => this.switchTab('create');
+    document.getElementById('tab-join').onclick = () => this.switchTab('join');
+    // Create / Join
+    document.getElementById('btn-create-room').onclick = () => this.createRoom();
+    document.getElementById('btn-join-room').onclick = () => this.joinRoom();
+    // In-room actions
+    this.els.lockBtn.onclick = () => this.toggleLock();
+    document.getElementById('btn-leave-room').onclick = () => this.leaveRoom();
+    document.getElementById('btn-copy-link').onclick = () => this.copyRoomLink();
+    document.getElementById('btn-show-qr').onclick = () => this.showQR();
+    document.getElementById('btn-select-files').onclick = () => this.openFilePicker();
+    document.getElementById('btn-select-folder').onclick = () => this.openFolderPicker();
+    this.els.btnSend.onclick = () => this.sendFiles();
+    this.els.btnCancelTransfers.onclick = () => this.cancelAllTransfers();
+    document.getElementById('btn-send-chat').onclick = () => this.sendChat();
+    this.els.chatInput.onkeypress = (e) => { if (e.key === 'Enter') this.sendChat(); };
 
-  users.forEach((user, socketId) => {
-    if (socketId === socket.id) return;
-    
-    const chip = document.createElement('div');
-    chip.className = 'send-to-user';
-    chip.dataset.socketId = socketId;
-    chip.textContent = user.nickname;
-    chip.addEventListener('click', () => {
-      chip.classList.toggle('selected');
+    // Drag & drop
+    this.els.fileDropZone.addEventListener('dragover', e => { e.preventDefault(); this.els.fileDropZone.classList.add('dragover'); });
+    this.els.fileDropZone.addEventListener('dragleave', () => this.els.fileDropZone.classList.remove('dragover'));
+    this.els.fileDropZone.addEventListener('drop', e => { e.preventDefault(); this.els.fileDropZone.classList.remove('dragover'); this.handleDrop(e.dataTransfer.items); });
+    this.els.fileDropZone.addEventListener('click', () => this.openFilePicker());
+
+    // QR modal close
+    document.querySelector('#qr-modal .close').onclick = () => this.els.qrModal.style.display = 'none';
+    window.onclick = (e) => { if (e.target === this.els.qrModal) this.els.qrModal.style.display = 'none'; };
+  }
+
+  // ---------- UI helpers ----------
+  showLoading() { this.els.loading.style.display = 'flex'; }
+  hideLoading() { this.els.loading.style.display = 'none'; this.els.main.style.display = 'block'; }
+  updateConnectionStatus(s) {
+    const dot = this.els.statusDot;
+    dot.classList.remove('connected', 'disconnected', 'connecting');
+    if (s === 'connected') dot.classList.add('connected');
+    else if (s === 'disconnected') dot.classList.add('disconnected');
+    else dot.classList.add('connecting');
+  }
+  switchTab(tab) {
+    document.getElementById('create-section').style.display = tab === 'create' ? '' : 'none';
+    document.getElementById('join-section').style.display = tab === 'join' ? '' : 'none';
+    document.getElementById('tab-create').classList.toggle('active', tab === 'create');
+    document.getElementById('tab-join').classList.toggle('active', tab === 'join');
+  }
+  showToast(msg, type = '') {
+    const toast = document.createElement('div'); toast.className = `toast ${type}`; toast.textContent = msg;
+    document.getElementById('toast-container').appendChild(toast);
+    setTimeout(() => toast.remove(), 4000);
+  }
+
+  // ---------- Avatar & nickname ----------
+  generateAvatar(nick) {
+    const canvas = document.createElement('canvas'); canvas.width = 64; canvas.height = 64;
+    const ctx = canvas.getContext('2d');
+    const hash = this.hashCode(nick || 'anon');
+    ctx.fillStyle = `hsl(${hash % 360}, 70%, 50%)`; ctx.fillRect(0,0,64,64);
+    ctx.fillStyle = 'white'; ctx.font = 'bold 28px sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText((nick?.[0] || 'A').toUpperCase(), 32, 32);
+    return canvas.toDataURL();
+  }
+  hashCode(s) { let h=0; for(let i=0;i<s.length;i++) h = ((h<<5)-h)+s.charCodeAt(i)|0; return Math.abs(h); }
+
+  getNickname() {
+    return document.getElementById('create-nickname').value.trim() || document.getElementById('join-nickname').value.trim() || 'User';
+  }
+
+  // ---------- Room management ----------
+  createRoom() {
+    const roomId = document.getElementById('custom-room-id').value.trim();
+    const password = document.getElementById('create-password').value;
+    const nick = this.getNickname();
+    if (!nick) return this.showToast('Enter a nickname', 'error');
+    const avatar = this.generateAvatar(nick);
+    this.socket.emit('create-room', { roomId, password, nickname: nick, avatar }, (res) => {
+      if (res.error) return this.showToast(res.error, 'error');
+      this.enterRoom(res.roomId, res.users, { socketId: this.socket.id, nickname: nick, avatar, isHost: true });
     });
-    usersContainer.appendChild(chip);
-  });
-}
-
-function handleFiles(fileList, isFolder) {
-  selectedFiles = [];
-  
-  for (let i = 0; i < fileList.length; i++) {
-    const file = fileList[i];
-    const folder = isFolder ? (file.webkitRelativePath || '').replace(/\/[^/]+$/, '') : '';
-    selectedFiles.push({ file, folder });
+  }
+  joinRoom() {
+    const roomId = document.getElementById('join-room-id').value.trim();
+    const password = document.getElementById('join-password').value;
+    const nick = this.getNickname();
+    if (!roomId || !nick) return this.showToast('Room ID and nickname required', 'error');
+    const avatar = this.generateAvatar(nick);
+    this.socket.emit('join-room', { roomId, password, nickname: nick, avatar }, (res) => {
+      if (res.error) return this.showToast(res.error, 'error');
+      this.enterRoom(res.roomId, res.users, res.myData);
+    });
+  }
+  enterRoom(roomId, users, myData) {
+    this.roomId = roomId;
+    this.myData = myData;
+    this.els.roomPanel.style.display = 'none';
+    this.els.roomUi.style.display = '';
+    this.els.roomIdDisplay.textContent = roomId;
+    this.users.clear();
+    users.forEach(u => this.users.set(u.socketId, u));
+    this.renderUserList();
+    this.connectToPeers(users);
+    this.updateHostUI();
+  }
+  onRejoined(users) {
+    this.els.roomPanel.style.display = 'none';
+    this.els.roomUi.style.display = '';
+    this.users.clear();
+    users.forEach(u => this.users.set(u.socketId, u));
+    this.renderUserList();
+    this.connectToPeers(users);
+    this.updateHostUI();
+  }
+  connectToPeers(users) {
+    users.forEach(u => {
+      if (u.socketId !== this.myData.socketId) this.webrtc.connectToPeer(u.socketId, true);
+    });
+  }
+  leaveRoom() {
+    this.roomId = null; this.myData = {};
+    this.webrtc.closeAll(); this.users.clear();
+    this.els.roomUi.style.display = 'none';
+    this.els.roomPanel.style.display = '';
+    this.selectedFiles = []; this.renderSelectedFiles();
+    this.els.transferList.innerHTML = '';
+    this.els.chatMessages.innerHTML = '';
+    this.socket.emit('leave-room'); // will disconnect from room
   }
 
-  if (selectedFiles.length === 0) {
-    showToast('No files selected', 'error');
-    return;
+  // ---------- User list & events ----------
+  onUserJoined(user) {
+    if (user.socketId === this.myData.socketId) return;
+    this.users.set(user.socketId, user);
+    this.renderUserList();
+    this.webrtc.connectToPeer(user.socketId, true);
+  }
+  onUserLeft(socketId) { this.users.delete(socketId); this.webrtc.closePeer(socketId); this.renderUserList(); }
+  onUserDisconnected({ socketId }) { const u = this.users.get(socketId); if (u) u.connected = false; this.renderUserList(); }
+  onUserUpdated(u) { if (this.users.has(u.socketId)) Object.assign(this.users.get(u.socketId), u); this.renderUserList(); }
+  renderUserList() {
+    const list = this.els.userList; list.innerHTML = '';
+    const hostId = [...this.users.values()].find(u => u.isHost)?.socketId;
+    for (const [id, u] of this.users) {
+      const li = document.createElement('li');
+      li.innerHTML = `<img src="${u.avatar}" class="avatar"> ${u.nickname}${u.socketId === hostId ? ' <span class="host-badge">HOST</span>' : ''}`;
+      if (this.myData.isHost && id !== this.myData.socketId) {
+        const kickBtn = document.createElement('button'); kickBtn.textContent = 'Kick'; kickBtn.className = 'btn small danger';
+        kickBtn.onclick = () => this.kickUser(id);
+        li.appendChild(kickBtn);
+      }
+      list.appendChild(li);
+    }
+    this.updateRecipientSelect();
+  }
+  updateRecipientSelect() {
+    const sel = this.els.recipientSelect;
+    sel.innerHTML = '<option value="all">Everyone</option>';
+    this.users.forEach((u, id) => { if (id !== this.myData.socketId) sel.innerHTML += `<option value="${id}">${u.nickname}</option>`; });
+  }
+  kickUser(socketId) { this.socket.emit('kick-user', { targetSocketId: socketId }, (r) => { if (r?.error) this.showToast(r.error, 'error'); }); }
+  toggleLock() {
+    const newState = !this.els.lockBtn.textContent.includes('🔒'); // rough
+    this.socket.emit('lock-room', newState, (r) => {
+      if (r?.success) this.els.lockBtn.textContent = r.locked ? '🔓 Unlock' : '🔒 Lock';
+      else this.showToast(r.error, 'error');
+    });
+  }
+  updateHostUI() {
+    this.els.lockBtn.style.display = this.myData.isHost ? '' : 'none';
   }
 
-  sendSelectedFiles();
-}
-
-function handleFileEntries(entries) {
-  selectedFiles = entries.map(entry => ({
-    file: entry.file,
-    folder: entry.path.replace(/\/[^/]+$/, '')
-  }));
-
-  if (selectedFiles.length === 0) {
-    showToast('No files selected', 'error');
-    return;
+  // ---------- Chat ----------
+  sendChat() {
+    const text = this.els.chatInput.value.trim(); if (!text) return;
+    this.addChatMessage(this.myData.nickname, text, this.myData.avatar, false);
+    this.users.forEach((_, id) => this.webrtc.sendChatMessage(id, { text, from: this.myData.nickname, avatar: this.myData.avatar }));
+    this.els.chatInput.value = '';
+  }
+  addChatMessage(from, text, avatar, isRemote) {
+    const msgDiv = document.createElement('div');
+    msgDiv.className = `chat-message${from === 'system' ? ' system' : ''}`;
+    if (from === 'system') msgDiv.textContent = text;
+    else msgDiv.innerHTML = `<span class="nick"><img src="${avatar}" class="avatar" style="width:20px;height:20px;"> ${from}:</span> ${text}`;
+    this.els.chatMessages.appendChild(msgDiv);
+    this.els.chatMessages.scrollTop = this.els.chatMessages.scrollHeight;
   }
 
-  sendSelectedFiles();
-}
-
-async function sendSelectedFiles() {
-  const sendToAll = document.querySelector('input[name="send-to"]:checked').value === 'all';
-  let targetSocketIds;
-
-  if (sendToAll) {
-    targetSocketIds = Array.from(users.keys()).filter(id => id !== socket.id);
-  } else {
-    targetSocketIds = Array.from(document.querySelectorAll('.send-to-user.selected'))
-      .map(el => el.dataset.socketId);
+  // ---------- File selection ----------
+  openFilePicker() { const inp = document.createElement('input'); inp.type = 'file'; inp.multiple = true; inp.onchange = () => this.addFiles(inp.files); inp.click(); }
+  openFolderPicker() { const inp = document.createElement('input'); inp.type = 'file'; inp.webkitdirectory = true; inp.multiple = true; inp.onchange = () => this.addFiles(inp.files, true); inp.click(); }
+  handleDrop(items) { this.traverseFileTree(items).then(files => this.addFiles(files)); }
+  async traverseFileTree(items) {
+    const files = [];
+    const readEntry = async (entry, path = '') => {
+      if (entry.isFile) {
+        const file = await new Promise(res => entry.file(res));
+        file.relativePath = path + file.name;
+        files.push(file);
+      } else if (entry.isDirectory) {
+        const reader = entry.createReader();
+        const entries = await new Promise(res => reader.readEntries(res));
+        for (const e of entries) await readEntry(e, path + entry.name + '/');
+      }
+    };
+    for (const item of items) {
+      const entry = item.webkitGetAsEntry?.() || (item.getAsEntry?.());
+      if (entry) await readEntry(entry);
+    }
+    return files;
   }
-
-  if (targetSocketIds.length === 0) {
-    showToast('No recipients selected', 'error');
-    return;
+  addFiles(files, fromFolder = false) {
+    for (const file of files) {
+      if (!file.relativePath) file.relativePath = file.name; // for dropped folders, already set
+      this.selectedFiles.push({ file, relativePath: file.relativePath, transferId: null });
+    }
+    this.renderSelectedFiles();
+    this.els.btnSend.disabled = this.selectedFiles.length === 0;
   }
+  renderSelectedFiles() {
+    const div = this.els.selectedFilesDiv; div.innerHTML = '';
+    this.selectedFiles.forEach((f, i) => {
+      const item = document.createElement('div'); item.className = 'file-item';
+      item.innerHTML = `<span class="icon">${this.fileIcon(f.file)}</span><span class="name">${f.file.relativePath || f.file.name}</span><span class="size">${this.formatSize(f.file.size)}</span>`;
+      const rm = document.createElement('button'); rm.textContent = '✕'; rm.className = 'btn small'; rm.onclick = () => { this.selectedFiles.splice(i,1); this.renderSelectedFiles(); this.els.btnSend.disabled = this.selectedFiles.length===0; };
+      item.appendChild(rm);
+      div.appendChild(item);
+    });
+  }
+  fileIcon(file) {
+    const ext = file.name.split('.').pop().toLowerCase();
+    if (['jpg','jpeg','png','gif','webp','bmp'].includes(ext)) return '🖼️';
+    if (['mp4','webm','ogg','mov'].includes(ext)) return '🎥';
+    if (['mp3','wav','aac','flac'].includes(ext)) return '🎵';
+    if (ext === 'pdf') return '📑';
+    if (['zip','rar','7z','tar','gz'].includes(ext)) return '📦';
+    return '📄';
+  }
+  formatSize(bytes) { if (bytes < 1024) return bytes + ' B'; const u = ['KB','MB','GB']; let i = -1; do { bytes /= 1024; i++; } while (bytes >= 1024 && i < u.length-1); return bytes.toFixed(1) + ' ' + u[i]; }
 
-  document.getElementById('transfers-section').style.display = 'block';
-
-  for (const { file, folder } of selectedFiles) {
-    const transferId = await webrtcManager.sendFile(file, targetSocketIds, folder);
-    const transfer = webrtcManager.transfers.get(transferId);
-    if (transfer) {
-      createTransferElement(transfer, 'send');
+  // ---------- Sending files ----------
+  sendFiles() {
+    if (!this.selectedFiles.length) return;
+    const recipients = this.getSelectedRecipients();
+    if (!recipients.length) return this.showToast('No recipients selected', 'error');
+    this.els.btnSend.disabled = true;
+    this.els.btnCancelTransfers.style.display = '';
+    for (const sf of this.selectedFiles) {
+      for (const peerId of recipients) {
+        const transferId = 't' + (++this.transferIdCounter);
+        sf.transferId = transferId;
+        this.transfers.set(transferId, { peerId, file: sf.file, status: 'pending', bytes: 0, total: sf.file.size, startTime: 0, speed: 0, lastBytes: 0 });
+        this.webrtc.sendFileOffer(peerId, transferId, { name: sf.file.name, size: sf.file.size, type: sf.file.type, relativePath: sf.file.relativePath });
+      }
+    }
+    this.renderTransferList();
+  }
+  getSelectedRecipients() {
+    const sel = this.els.recipientSelect;
+    if (sel.value === 'all' || sel.selectedOptions[0]?.value === 'all') return [...this.users.keys()];
+    return [...sel.selectedOptions].map(o => o.value);
+  }
+  handleIncomingOffer({ peerSocketId, transferId, file: fileInfo }) {
+    if (this.pendingOffers.has(transferId)) return;
+    this.pendingOffers.set(transferId, { peerSocketId, fileInfo });
+    this.showTransferAcceptPrompt(transferId, peerSocketId, fileInfo);
+  }
+  showTransferAcceptPrompt(transferId, peerId, fileInfo) {
+    const accept = confirm(`${this.users.get(peerId)?.nickname || 'User'} wants to send "${fileInfo.name}" (${this.formatSize(fileInfo.size)}). Accept?`);
+    this.webrtc.sendFileResponse(peerId, transferId, accept);
+    this.pendingOffers.delete(transferId);
+    if (!accept) return;
+    // Sender will start the transfer; on receiver side we just wait for file channel
+  }
+  handleTransferResponse({ peerSocketId, transferId, accepted, reason }) {
+    const t = this.transfers.get(transferId);
+    if (!t) return;
+    if (accepted) {
+      t.status = 'transferring';
+      t.startTime = performance.now();
+      this.webrtc.startFileTransfer(peerSocketId, transferId, t.file);
+      this.renderTransferList();
+    } else {
+      this.transfers.delete(transferId);
+      this.renderTransferList();
     }
   }
-
-  selectedFiles = [];
-  document.getElementById('file-input').value = '';
-  document.getElementById('folder-input').value = '';
-}
-
-function createTransferElement(transfer, type) {
-  const list = document.getElementById('transfers-list');
-  const item = document.createElement('div');
-  item.className = 'transfer-item';
-  item.id = `transfer-${transfer.id}`;
-
-  const icon = getFileIcon(transfer.type, transfer.name);
-  const folder = transfer.folder ? `<span>📁 ${escapeHtml(transfer.folder)}</span>` : '';
-
-  item.innerHTML = `
-    <div class="transfer-icon">${icon}</div>
-    <div class="transfer-info">
-      <div class="transfer-name">${escapeHtml(transfer.name)}</div>
-      <div class="transfer-meta">
-        <span>${formatBytes(transfer.size)}</span>
-        ${folder}
-      </div>
-      <div class="transfer-progress">
-        <div class="progress-bar">
-          <div class="progress-fill" style="width: 0%"></div>
-        </div>
-      </div>
-      <div class="transfer-stats">
-        <span class="progress-text">0%</span>
-        <span class="speed-text">--</span>
-        <span class="eta-text">--</span>
-      </div>
-    </div>
-    <div class="transfer-actions">
-      ${type === 'send' ? `<button class="icon-btn small" onclick="cancelTransfer(${transfer.id})">✖</button>` : ''}
-    </div>
-  `;
-
-  list.appendChild(item);
-  transferElements.set(transfer.id, item);
-}
-
-function updateTransferUI(transfer) {
-  const item = transferElements.get(transfer.id);
-  if (!item) return;
-
-  const isSend = transfer.file !== undefined;
-  const total = transfer.size;
-  const current = isSend ? transfer.bytesSent : transfer.bytesReceived;
-  const progress = total > 0 ? (current / total) * 100 : 0;
-
-  const progressFill = item.querySelector('.progress-fill');
-  const progressText = item.querySelector('.progress-text');
-  const speedText = item.querySelector('.speed-text');
-  const etaText = item.querySelector('.eta-text');
-
-  progressFill.style.width = `${progress}%`;
-  progressText.textContent = `${progress.toFixed(1)}%`;
-
-  if (transfer.status === 'complete') {
-    progressFill.classList.add('complete');
-    speedText.textContent = 'Complete';
-    etaText.textContent = '✓';
-  } else if (transfer.status === 'cancelled') {
-    progressFill.classList.add('error');
-    speedText.textContent = 'Cancelled';
-    etaText.textContent = '✖';
-  } else if (transfer.status === 'receiving' || transfer.status === 'sending') {
-    const elapsed = (Date.now() - (transfer.startTime || Date.now())) / 1000;
-    const speed = elapsed > 0 ? current / elapsed : 0;
-    const remaining = total - current;
-    const eta = speed > 0 ? remaining / speed : 0;
-
-    speedText.textContent = `${formatBytes(speed)}/s`;
-    etaText.textContent = `ETA: ${formatTime(eta)}`;
+  updateTransferProgress(p) {
+    const t = this.transfers.get(p.transferId);
+    if (!t && p.status === 'started') { /* receiver started */ }
+    if (!t) return;
+    t.status = p.status;
+    if (p.sentBytes) t.bytes = p.sentBytes;
+    if (p.receivedBytes) t.bytes = p.receivedBytes;
+    t.lastBytes = t.bytes;
+    if (p.status === 'cancelled' || p.status === 'completed') this.transfers.delete(p.transferId);
+    this.renderTransferList();
   }
-}
-
-function cancelTransfer(transferId) {
-  webrtcManager.cancelTransfer(transferId);
-  showToast('Transfer cancelled', 'warning');
-}
-
-function clearCompletedTransfers() {
-  document.querySelectorAll('.transfer-item').forEach(item => {
-    const fill = item.querySelector('.progress-fill');
-    if (fill.classList.contains('complete') || fill.classList.contains('error')) {
-      item.remove();
+  cancelAllTransfers() {
+    for (const [tid, t] of this.transfers) this.webrtc.sendFileCancel(t.peerId, tid);
+    this.transfers.clear();
+    this.renderTransferList();
+    this.els.btnCancelTransfers.style.display = 'none';
+  }
+  handleReceivedFile({ peerSocketId, file, metadata }) {
+    this.showToast(`Received ${file.name}`, 'success');
+    const url = URL.createObjectURL(file);
+    if (file.type.startsWith('image/')) this.previewFile(url, 'image');
+    else if (file.type.startsWith('video/')) this.previewFile(url, 'video');
+    else if (file.type.startsWith('audio/')) this.previewFile(url, 'audio');
+    else if (file.type === 'application/pdf') window.open(url, '_blank');
+    else {
+      const a = document.createElement('a'); a.href = url; a.download = file.name; a.click(); URL.revokeObjectURL(url);
     }
-  });
-}
-
-function showFileRequestModal(receive) {
-  pendingFileRequest = receive;
-  
-  const info = document.getElementById('file-request-info');
-  const icon = getFileIcon(receive.type, receive.name);
-  const fromUser = users.get(receive.from);
-  const fromName = fromUser ? fromUser.nickname : 'Unknown';
-  const folder = receive.folder ? `<p>📁 ${escapeHtml(receive.folder)}</p>` : '';
-
-  info.innerHTML = `
-    <div class="file-request-icon">${icon}</div>
-    <div class="file-request-details">
-      <h4>${escapeHtml(receive.name)}</h4>
-      <p>${formatBytes(receive.size)} • From: ${escapeHtml(fromName)}</p>
-      ${folder}
-    </div>
-  `;
-
-  openModal('file-request-modal');
-}
-
-function acceptPendingFile() {
-  if (pendingFileRequest) {
-    webrtcManager.acceptFile(pendingFileRequest.id);
-    document.getElementById('transfers-section').style.display = 'block';
-    createTransferElement(pendingFileRequest, 'receive');
-    addSystemMessage(`Accepting: ${pendingFileRequest.name}`);
   }
-  closeModal('file-request-modal');
-  pendingFileRequest = null;
-}
-
-function rejectPendingFile() {
-  if (pendingFileRequest) {
-    webrtcManager.rejectFile(pendingFileRequest.id);
-    addSystemMessage(`Rejected: ${pendingFileRequest.name}`);
+  previewFile(url, type) {
+    const w = window.open('', '_blank');
+    w.document.write(`<${type} controls style="max-width:100%;max-height:100vh;" src="${url}"></${type}>`);
   }
-  closeModal('file-request-modal');
-  pendingFileRequest = null;
-}
-
-function sendChatMessage() {
-  const input = document.getElementById('chat-input');
-  const message = input.value.trim();
-  
-  if (!message) return;
-  
-  socket.emit('chat-message', { message });
-  input.value = '';
-  document.getElementById('emoji-picker').style.display = 'none';
-}
-
-function addChatMessage(message) {
-  const container = document.getElementById('chat-messages');
-  const div = document.createElement('div');
-  
-  if (message.type === 'system') {
-    div.className = 'chat-message system';
-    div.innerHTML = `<div class="message-text">${escapeHtml(message.message)}</div>`;
-  } else {
-    div.className = 'chat-message';
-    const time = new Date(message.timestamp).toLocaleTimeString();
-    div.innerHTML = `
-      <div class="avatar"><img src="${message.avatar}" alt=""></div>
-      <div class="message-content">
-        <div class="message-header">
-          <span class="nickname">${escapeHtml(message.nickname)}</span>
-          <span class="timestamp">${time}</span>
-        </div>
-        <div class="message-text">${escapeHtml(message.message)}</div>
-      </div>
-    `;
+  renderTransferList() {
+    const div = this.els.transferList; div.innerHTML = '';
+    for (const [tid, t] of this.transfers) {
+      const pct = t.total ? Math.min(100, (t.bytes / t.total * 100)).toFixed(1) : 0;
+      const speed = this.calcSpeed(t);
+      div.innerHTML += `<div class="file-item"><span>${t.file.name}</span><div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div><span class="speed">${pct}% ${speed}</span></div>`;
+    }
   }
-  
-  container.appendChild(div);
-  container.scrollTop = container.scrollHeight;
-}
+  calcSpeed(t) {
+    if (!t.startTime) return '';
+    const elapsed = (performance.now() - t.startTime) / 1000;
+    if (elapsed < 0.5) return '';
+    const bytes = t.bytes; const speed = bytes / elapsed;
+    return this.formatSize(speed) + '/s';
+  }
 
-function addSystemMessage(text) {
-  addChatMessage({ type: 'system', message: text, timestamp: Date.now() });
-}
-
-function copyRoomLink() {
-  const link = `${window.location.origin}?room=${currentRoomId}`;
-  navigator.clipboard.writeText(link).then(() => {
-    showToast('Link copied to clipboard', 'success');
-  }).catch(() => {
-    showToast('Failed to copy link', 'error');
-  });
-}
-
-function showQRCode() {
-  const link = `${window.location.origin}?room=${currentRoomId}`;
-  const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(link)}&size=200x200`;
-  document.getElementById('qr-code-container').innerHTML = `<img src="${qrUrl}" alt="QR Code">`;
-  openModal('qr-modal');
-}
-
-function toggleLockRoom() {
-  const lockBtn = document.getElementById('lock-room-btn');
-  const isLocked = lockBtn.textContent === '🔒';
-  socket.emit('lock-room', { locked: !isLocked });
-}
-
-function kickUser(socketId) {
-  if (confirm('Are you sure you want to kick this user?')) {
-    socket.emit('kick-user', { targetSocketId: socketId });
-    showToast('User kicked', 'success');
+  // ---------- Copy & QR ----------
+  copyRoomLink() {
+    const link = `${window.location.origin}?room=${this.roomId}`;
+    navigator.clipboard.writeText(link).then(() => this.showToast('Link copied!'));
+  }
+  showQR() {
+    const link = `${window.location.origin}?room=${this.roomId}`;
+    this.els.qrCodeDiv.innerHTML = '';
+    new QRCode(this.els.qrCodeDiv, { text: link, width: 200, height: 200 });
+    this.els.qrModal.style.display = 'flex';
   }
 }
 
-function leaveRoom() {
-  if (confirm('Are you sure you want to leave the room?')) {
-    if (webrtcManager) webrtcManager.close();
-    socket.emit('leave-room');
-    setTimeout(() => location.reload(), 500);
-  }
-}
-
-function showPasswordModal(roomId) {
-  openModal('password-modal');
-  document.getElementById('modal-password-submit').onclick = () => {
-    const password = document.getElementById('modal-password-input').value;
-    closeModal('password-modal');
-    connectSocket(currentUser.nickname, roomId, password);
-  };
-}
-
-function submitPassword() {
-  // Handled by dynamic onclick
-}
-
-function openModal(id) {
-  document.getElementById(id).classList.add('active');
-}
-
-function closeModal(id) {
-  document.getElementById(id).classList.remove('active');
-}
-
-function updateConnectionIndicator(state) {
-  const indicator = document.getElementById('connection-indicator');
-  const dot = indicator.querySelector('.indicator-dot');
-  const text = indicator.querySelector('.indicator-text');
-  
-  dot.className = 'indicator-dot';
-  
-  switch (state) {
-    case 'connected':
-      text.textContent = 'Connected';
-      break;
-    case 'disconnected':
-      dot.classList.add('disconnected');
-      text.textContent = 'Disconnected';
-      break;
-    case 'connecting':
-      dot.classList.add('connecting');
-      text.textContent = 'Connecting...';
-      break;
-  }
-}
-
-function showToast(message, type = 'info') {
-  const container = document.getElementById('toast-container');
-  const toast = document.createElement('div');
-  toast.className = `toast ${type}`;
-  
-  const icons = { success: '✓', error: '✖', warning: '⚠', info: 'ℹ' };
-  
-  toast.innerHTML = `
-    <div class="toast-icon">${icons[type]}</div>
-    <div class="toast-message">${escapeHtml(message)}</div>
-  `;
-  
-  container.appendChild(toast);
-  
-  setTimeout(() => {
-    toast.classList.add('removing');
-    setTimeout(() => toast.remove(), 300);
-  }, 3000);
-}
-
-function generateAvatar(name) {
-  const colors = ['6366f1', '8b5cf6', 'ec4899', 'f59e0b', '10b981', '3b82f6', 'ef4444'];
-  const color = colors[Math.floor(Math.random() * colors.length)];
-  return `https://ui-avatars.com/api/?name=${encodeURIComponent(name)}&background=${color}&color=fff&size=64&bold=true`;
-}
-
-function escapeHtml(text) {
-  const div = document.createElement('div');
-  div.textContent = text;
-  return div.innerHTML;
-}
-
-// Handle URL parameters for direct room join
-window.addEventListener('load', () => {
+// Boot
+window.addEventListener('DOMContentLoaded', () => {
+  const app = new FileShareApp();
+  app.init();
+  app.showLoading();
+  // Check for room in URL
   const params = new URLSearchParams(window.location.search);
-  const roomId = params.get('room');
-  if (roomId) {
-    document.getElementById('room-id-input').value = roomId.toUpperCase();
+  const roomFromUrl = params.get('room');
+  if (roomFromUrl) {
+    document.getElementById('join-room-id').value = roomFromUrl;
+    document.getElementById('tab-join').click();
   }
 });
